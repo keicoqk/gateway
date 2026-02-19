@@ -1,4 +1,4 @@
-package sdk
+package gateway
 
 import (
 	"encoding/base64"
@@ -45,4 +45,3 @@ func decodeRequestBody(r *http.Request) ([]byte, error) {
 	}
 	return decoded, nil
 }
-

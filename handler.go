@@ -1,4 +1,4 @@
-package sdk
+package gateway
 
 import (
 	"encoding/base64"

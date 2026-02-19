@@ -6,7 +6,7 @@ import (
 	"log"
 	"net/http"
 
-	_ "github.com/keicoqk/gateway/sdk"
+	_ "github.com/keicoqk/gateway"
 )
 
 func main() {
