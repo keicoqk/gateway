@@ -36,12 +36,14 @@ func Handler(opts Options) http.Handler {
 	inv := core.NewInvoker(core.DefaultDescriptorDir(), opts.Timeout)
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
-			writeJSONError(w, http.StatusMethodNotAllowed, "method must be POST")
+			// writeJSONError(w, http.StatusMethodNotAllowed, "method must be POST")
+			w.WriteHeader(http.StatusNotFound)
 			return
 		}
 		decodedBody, err := decodeRequestBody(r)
 		if err != nil {
-			writeJSONError(w, http.StatusBadRequest, "invalid encoded body: "+err.Error())
+			w.WriteHeader(http.StatusNotFound)
+			// writeJSONError(w, http.StatusBadRequest, "invalid encoded body: "+err.Error())
 			return
 		}
 		var req gatewayRequest
