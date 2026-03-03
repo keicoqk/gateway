@@ -101,12 +101,143 @@ func (p *InlineDescriptorPool) Resolve(service string, method string) (*Resolved
 type InlineMethodResolver struct {
 	mu    sync.RWMutex
 	pools map[string]*InlineDescriptorPool
+	// pending holds in-progress chunked descriptor uploads, keyed by descriptorID.
+	pending map[string]*descriptorSyncState
 }
 
 func NewInlineMethodResolver() *InlineMethodResolver {
 	return &InlineMethodResolver{
-		pools: make(map[string]*InlineDescriptorPool),
+		pools:   make(map[string]*InlineDescriptorPool),
+		pending: make(map[string]*descriptorSyncState),
 	}
+}
+
+const (
+	maxDescriptorSyncChunks = 2048
+	maxDescriptorSyncBytes  = 32 << 20 // 32MiB
+)
+
+type descriptorSyncState struct {
+	total    int
+	received int
+	size     int
+	chunks   map[int][]byte
+}
+
+func newDescriptorSyncState(total int) *descriptorSyncState {
+	return &descriptorSyncState{
+		total:  total,
+		chunks: make(map[int][]byte, total),
+	}
+}
+
+func (s *descriptorSyncState) assemble() ([]byte, error) {
+	if s.total <= 0 {
+		return nil, fmt.Errorf("invalid total chunks: %d", s.total)
+	}
+	if len(s.chunks) != s.total {
+		return nil, fmt.Errorf("incomplete chunks: got %d, want %d", len(s.chunks), s.total)
+	}
+	out := make([]byte, 0, s.size)
+	for i := 0; i < s.total; i++ {
+		b, ok := s.chunks[i]
+		if !ok {
+			return nil, fmt.Errorf("missing chunk index %d", i)
+		}
+		out = append(out, b...)
+	}
+	return out, nil
+}
+
+// SyncDescriptorChunk accepts one descriptor chunk and, once complete, builds and caches the descriptor pool under descriptorID.
+// Chunks are expected to be 0-based indexed: index in [0, total).
+//
+// If reset is true, any existing cached descriptor (and in-progress sync state) for descriptorID is cleared first.
+func (r *InlineMethodResolver) SyncDescriptorChunk(descriptorID string, index, total int, chunk []byte, reset bool) (received int, totalChunks int, done bool, err error) {
+	descriptorID = strings.TrimSpace(descriptorID)
+	if descriptorID == "" {
+		return 0, 0, false, fmt.Errorf("empty descriptor id")
+	}
+	if total <= 0 {
+		return 0, 0, false, fmt.Errorf("invalid total chunks: %d", total)
+	}
+	if total > maxDescriptorSyncChunks {
+		return 0, 0, false, fmt.Errorf("too many chunks: %d (max %d)", total, maxDescriptorSyncChunks)
+	}
+	if index < 0 || index >= total {
+		return 0, 0, false, fmt.Errorf("invalid chunk index %d (total %d)", index, total)
+	}
+	if len(chunk) == 0 {
+		return 0, 0, false, fmt.Errorf("empty chunk")
+	}
+	if len(chunk) > maxDescriptorSyncBytes {
+		return 0, 0, false, fmt.Errorf("chunk too large: %d bytes", len(chunk))
+	}
+
+	r.mu.RLock()
+	_, alreadyCached := r.pools[descriptorID]
+	r.mu.RUnlock()
+	if alreadyCached && !reset {
+		return total, total, true, nil
+	}
+
+	var assembled []byte
+
+	r.mu.Lock()
+	if reset {
+		delete(r.pools, descriptorID)
+	}
+	if _, ok := r.pools[descriptorID]; ok {
+		// Another goroutine may have cached it after our read lock.
+		r.mu.Unlock()
+		return total, total, true, nil
+	}
+	st := r.pending[descriptorID]
+	if st == nil {
+		st = newDescriptorSyncState(total)
+		r.pending[descriptorID] = st
+	}
+	if st.total != total {
+		r.mu.Unlock()
+		return 0, 0, false, fmt.Errorf("chunk total mismatch for %q: got %d, want %d", descriptorID, total, st.total)
+	}
+	if _, ok := st.chunks[index]; !ok {
+		if st.size+len(chunk) > maxDescriptorSyncBytes {
+			r.mu.Unlock()
+			return 0, 0, false, fmt.Errorf("descriptor too large: %d bytes (max %d)", st.size+len(chunk), maxDescriptorSyncBytes)
+		}
+		// Copy chunk bytes to decouple from caller buffer.
+		st.chunks[index] = append([]byte(nil), chunk...)
+		st.received++
+		st.size += len(chunk)
+	}
+	received = st.received
+	totalChunks = st.total
+	done = received == totalChunks
+	if done {
+		assembled, err = st.assemble()
+		if err != nil {
+			r.mu.Unlock()
+			return received, totalChunks, false, err
+		}
+	}
+	r.mu.Unlock()
+
+	if !done {
+		return received, totalChunks, false, nil
+	}
+
+	pool, err := newInlineDescriptorPool(assembled)
+	if err != nil {
+		return received, totalChunks, false, err
+	}
+
+	r.mu.Lock()
+	r.pools[descriptorID] = pool
+	delete(r.pending, descriptorID)
+	r.mu.Unlock()
+
+	return totalChunks, totalChunks, true, nil
 }
 
 // Resolve resolves the concrete method by descriptor bytes or descriptorID.
@@ -146,4 +277,3 @@ func (r *InlineMethodResolver) Resolve(descriptorSetBytes []byte, descriptorID, 
 	}
 	return rm, key, nil
 }
-

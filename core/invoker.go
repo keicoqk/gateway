@@ -26,6 +26,12 @@ func NewInvoker(descriptorDir string, timeout time.Duration) *Invoker {
 	}
 }
 
+// SyncInlineDescriptorChunk streams a descriptor in chunks into the in-memory cache.
+// Once all chunks are received, the descriptor pool is built and stored under descriptorID.
+func (inv *Invoker) SyncInlineDescriptorChunk(descriptorID string, index, total int, chunk []byte, reset bool) (received int, totalChunks int, done bool, err error) {
+	return inv.inlineResolver.SyncDescriptorChunk(descriptorID, index, total, chunk, reset)
+}
+
 // InvokeRequest is the input for the HTTP gateway.
 type InvokeRequest struct {
 	Target         string // gRPC target address, e.g. "host:port"

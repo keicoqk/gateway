@@ -25,10 +25,24 @@ type gatewayRequest struct {
 	Descriptor   string          `json:"descriptor"`    // base64(FileDescriptorSet bytes)
 	DescriptorID string          `json:"descriptor_id"` // logical ID; if only this is sent, use cached descriptor
 	Params       json.RawMessage `json:"params"`        // v2 request body JSON (alternative to body)
+
+	// v2: chunked descriptor sync (to avoid oversized request bodies).
+	// Chunks are 0-based: index in [0, total).
+	DescriptorChunk      string `json:"descriptor_chunk"`       // base64(chunk bytes)
+	DescriptorChunkIndex int    `json:"descriptor_chunk_index"` // 0-based index
+	DescriptorChunkTotal int    `json:"descriptor_chunk_total"` // total chunks
+	DescriptorChunkReset bool   `json:"descriptor_chunk_reset"` // if true, clear existing cache before syncing
 }
 
 type errorResponse struct {
 	Error string `json:"error"`
+}
+
+type descriptorSyncResponse struct {
+	DescriptorID   string `json:"descriptor_id"`
+	ReceivedChunks int    `json:"received_chunks"`
+	TotalChunks    int    `json:"total_chunks"`
+	Done           bool   `json:"done"`
 }
 
 // Handler returns the gateway http.Handler; descriptors are read from the SDK core package directory (shipped with SDK, callers need not generate).
@@ -49,6 +63,39 @@ func Handler(opts Options) http.Handler {
 		var req gatewayRequest
 		if err := json.Unmarshal(decodedBody, &req); err != nil {
 			writeJSONError(w, http.StatusBadRequest, "invalid JSON body: "+err.Error())
+			return
+		}
+
+		// Chunked descriptor sync path: uses the same HTTP endpoint, but does not invoke gRPC.
+		// This must run before target/method validation because syncing does not require them.
+		if req.DescriptorChunk != "" || req.DescriptorChunkTotal > 0 || req.DescriptorChunkIndex > 0 || req.DescriptorChunkReset {
+			if req.DescriptorID == "" {
+				writeJSONError(w, http.StatusBadRequest, "missing descriptor_id for descriptor chunk sync")
+				return
+			}
+			if req.DescriptorChunk == "" {
+				writeJSONError(w, http.StatusBadRequest, "missing descriptor_chunk for descriptor chunk sync")
+				return
+			}
+			chunkBytes, err := base64.StdEncoding.DecodeString(req.DescriptorChunk)
+			if err != nil {
+				writeJSONError(w, http.StatusBadRequest, "invalid base64 descriptor_chunk: "+err.Error())
+				return
+			}
+			received, total, done, err := inv.SyncInlineDescriptorChunk(req.DescriptorID, req.DescriptorChunkIndex, req.DescriptorChunkTotal, chunkBytes, req.DescriptorChunkReset)
+			if err != nil {
+				writeJSONError(w, http.StatusBadRequest, "sync descriptor chunk: "+err.Error())
+				return
+			}
+
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusOK)
+			_ = json.NewEncoder(w).Encode(descriptorSyncResponse{
+				DescriptorID:   req.DescriptorID,
+				ReceivedChunks: received,
+				TotalChunks:    total,
+				Done:           done,
+			})
 			return
 		}
 

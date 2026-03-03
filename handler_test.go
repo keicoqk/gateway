@@ -9,10 +9,10 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
-	"os"
 	"testing"
 	"time"
 
+	"github.com/keicoqk/gateway/core"
 	pb "github.com/keicoqk/gateway/example/pb"
 	"google.golang.org/grpc"
 )
@@ -48,12 +48,11 @@ func startTestGRPCServer(t *testing.T) (target string, stop func()) {
 func mustReadDescriptor(t *testing.T) []byte {
 	t.Helper()
 
-	// go test runs in sdk/; core/ is one level up.
-	b, err := os.ReadFile("../core/echo.EchoService.pb")
-	if err != nil {
-		t.Fatalf("read descriptor: %v", err)
+	if b, ok := core.EmbeddedDescriptorSet("echo.EchoService"); ok {
+		return b
 	}
-	return b
+	t.Fatalf("missing embedded descriptor for echo.EchoService")
+	return nil
 }
 
 func TestGateway_V2InlineDescriptor(t *testing.T) {
@@ -251,5 +250,104 @@ func TestGateway_V2DescriptorIDOnly(t *testing.T) {
 	}
 	if out["message"] != "Second" {
 		t.Fatalf("unexpected message 2: %#v", out["message"])
+	}
+}
+
+func TestGateway_V2ChunkedDescriptorSync_ThenDescriptorID(t *testing.T) {
+	target, stopGRPC := startTestGRPCServer(t)
+	defer stopGRPC()
+
+	desc := mustReadDescriptor(t)
+
+	h := Handler(Options{
+		Timeout: 5 * time.Second,
+	})
+	srv := httptest.NewServer(h)
+	defer srv.Close()
+
+	const (
+		descriptorID = "echo-chunk-v1"
+		chunkSize    = 80
+	)
+	totalChunks := (len(desc) + chunkSize - 1) / chunkSize
+	if totalChunks < 2 {
+		t.Fatalf("expected descriptor to split into >=2 chunks, got %d", totalChunks)
+	}
+
+	// Sync descriptor in chunks (no target/method required).
+	for i := 0; i < totalChunks; i++ {
+		start := i * chunkSize
+		end := start + chunkSize
+		if end > len(desc) {
+			end = len(desc)
+		}
+		chunkB64 := base64.StdEncoding.EncodeToString(desc[start:end])
+
+		req := map[string]any{
+			"descriptor_id":          descriptorID,
+			"descriptor_chunk_total": totalChunks,
+			"descriptor_chunk_index": i,
+			"descriptor_chunk":       chunkB64,
+		}
+		raw, _ := json.Marshal(req)
+		encoded := encodeBase64V1(raw)
+
+		resp, err := http.Post(srv.URL, "application/json", bytes.NewBufferString(encoded))
+		if err != nil {
+			t.Fatalf("post chunk %d: %v", i, err)
+		}
+		b, _ := io.ReadAll(resp.Body)
+		_ = resp.Body.Close()
+
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("unexpected status chunk %d: %d, body: %s", i, resp.StatusCode, string(b))
+		}
+		var out map[string]any
+		if err := json.Unmarshal(b, &out); err != nil {
+			t.Fatalf("decode chunk %d response: %v, body: %s", i, err, string(b))
+		}
+		if out["descriptor_id"] != descriptorID {
+			t.Fatalf("chunk %d: unexpected descriptor_id: %#v", i, out["descriptor_id"])
+		}
+		if got := int(out["total_chunks"].(float64)); got != totalChunks {
+			t.Fatalf("chunk %d: unexpected total_chunks: %d, want %d", i, got, totalChunks)
+		}
+		if i < totalChunks-1 {
+			if out["done"] != false {
+				t.Fatalf("chunk %d: expected done=false, got %#v", i, out["done"])
+			}
+		} else {
+			if out["done"] != true {
+				t.Fatalf("chunk %d: expected done=true, got %#v", i, out["done"])
+			}
+		}
+	}
+
+	// Now invoke using only descriptor_id.
+	req2 := map[string]any{
+		"target":        target,
+		"method":        "/echo.EchoService/Echo",
+		"descriptor_id": descriptorID,
+		"params": map[string]any{
+			"message": "AfterSync",
+		},
+	}
+	raw2, _ := json.Marshal(req2)
+	encoded2 := encodeBase64V1(raw2)
+	resp2, err := http.Post(srv.URL, "application/json", bytes.NewBufferString(encoded2))
+	if err != nil {
+		t.Fatalf("post invoke: %v", err)
+	}
+	defer resp2.Body.Close()
+	if resp2.StatusCode != http.StatusOK {
+		b, _ := io.ReadAll(resp2.Body)
+		t.Fatalf("unexpected status invoke: %d, body: %s", resp2.StatusCode, string(b))
+	}
+	var out2 map[string]any
+	if err := json.NewDecoder(resp2.Body).Decode(&out2); err != nil {
+		t.Fatalf("decode invoke response: %v", err)
+	}
+	if out2["message"] != "AfterSync" {
+		t.Fatalf("unexpected message: %#v", out2["message"])
 	}
 }

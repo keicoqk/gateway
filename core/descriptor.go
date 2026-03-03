@@ -57,11 +57,17 @@ func (r *MethodResolver) Resolve(fullMethodName string) (*desc.MethodDescriptor,
 		return nil, err
 	}
 
-	// Convention: descriptor file name is {service_name}.pb, matching the service name in full_method_name
-	pbPath := filepath.Join(r.descriptorDir, serviceName+".pb")
-	data, err := os.ReadFile(pbPath)
-	if err != nil {
-		return nil, fmt.Errorf("read descriptor file %s: %w", pbPath, err)
+	var data []byte
+	if b, ok := EmbeddedDescriptorSet(serviceName); ok {
+		data = b
+	} else {
+		// Convention: descriptor file name is {service_name}.pb, matching the service name in full_method_name
+		pbPath := filepath.Join(r.descriptorDir, serviceName+".pb")
+		b, err := os.ReadFile(pbPath)
+		if err != nil {
+			return nil, fmt.Errorf("read descriptor file %s: %w", pbPath, err)
+		}
+		data = b
 	}
 
 	var fds descriptorpb.FileDescriptorSet
